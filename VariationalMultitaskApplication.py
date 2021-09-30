@@ -10,6 +10,7 @@ import gpytorch
 import sklearn
 from sklearn.model_selection import train_test_split
 import tqdm
+from scipy.cluster.vq import kmeans2
 
 class StandardScaler:
   def fit(self, x):
@@ -26,6 +27,7 @@ class StandardScaler:
         '''To transform standard deviation'''
         return x * (self.std + 1e-7)
 
+num_inducing_pts = 1000            # Number of inducing points in each hidden layer
 num_tasks = 3
 num_latents = 4 # how many linear functions are learned to correlate tasks. 
 xdata = pd.read_csv('xdf.csv',index_col=0)
@@ -45,18 +47,28 @@ train_x = scaler.transform(xtr1).double()
 test_x = scaler.transform(xte1).double()
 train_y = scaler1.transform(ytr1).double()
 test_y = scaler1.transform(yte1).double()
+train_n = len(train_x) ##############################################################################333
 
 train_dataset = TensorDataset(train_x, train_y)
 val_dataset = TensorDataset(test_x, test_y)
 
-train_loader = DataLoader(dataset=train_dataset, batch_size=20, drop_last=True)
-val_loader = DataLoader(dataset=val_dataset, batch_size=20, drop_last=False)
+train_loader = DataLoader(dataset=train_dataset, batch_size=1000, drop_last=False)
+val_loader = DataLoader(dataset=val_dataset, batch_size=1000, drop_last=False)
 
 class MultitaskGPModel(gpytorch.models.ApproximateGP):
     def __init__(self):
+
         # Let's use a different set of inducing points for each latent function
-        inducing_points = torch.rand(num_latents, 20, 12)
-        
+        # Use k-means to initialize inducing points (only helpful for the first layer)
+        inducing_points = (train_x[torch.randperm(min(1000 * 100, train_n))[0:num_inducing_pts], :])
+        inducing_points = inducing_points.clone().data.cpu().numpy()
+        inducing_points = torch.tensor(kmeans2(train_x.data.cpu().numpy(),
+                               inducing_points, minit='matrix')[0])
+
+        if torch.cuda.is_available():
+          inducing_points = inducing_points.cuda()
+
+
         # We have to mark the CholeskyVariationalDistribution as batch
         # so that we learn a variational distribution for each task
         variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
@@ -97,52 +109,17 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model = MultitaskGPModel().double().to(device)
 likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=3).to(device)
 
-class IndependentMultitaskGPModel(gpytorch.models.ApproximateGP):
-    def __init__(self):
-        # Let's use a different set of inducing points for each task
-        inducing_points = torch.rand(num_tasks, 20, 12)
-        
-        # We have to mark the CholeskyVariationalDistribution as batch
-        # so that we learn a variational distribution for each task
-        variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
-            inducing_points.size(-2), batch_shape=torch.Size([num_tasks])
-        )
-        
-        variational_strategy = gpytorch.variational.IndependentMultitaskVariationalStrategy(
-            gpytorch.variational.VariationalStrategy(
-                self, inducing_points, variational_distribution, learn_inducing_locations=True
-            ),
-            num_tasks=num_tasks,
-        )
-        
-        super().__init__(variational_strategy)
-        
-        # The mean and covariance modules should be marked as batch
-        # so we learn a different set of hyperparameters
-        self.mean_module = gpytorch.means.ConstantMean(batch_shape=torch.Size([num_tasks]))
-        self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.RBFKernel(batch_shape=torch.Size([num_tasks])),
-            batch_shape=torch.Size([num_tasks])
-        )
-        
-    def forward(self, x):
-        # The forward function should be written as if we were dealing with each output
-        # dimension in batch
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
 #smoke_test = ('CI' in os.environ)
-num_epochs = 10 #if smoke_test else 500
+num_epochs = 1000 #if smoke_test else 500
 
 
 model.train()
 likelihood.train()
 
-optimizer = torch.optim.SGD([
+optimizer = torch.optim.Adam([
     {'params': model.parameters()},
     {'params': likelihood.parameters()},
-], lr=0.03)
+], lr=.001)
 
 # Our loss object. We're using the VariationalELBO, which essentially just computes the ELBO
 mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=train_y.size(0)).cuda()
@@ -150,6 +127,7 @@ mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=train_y.size(0))
 # We use more CG iterations here because the preconditioner introduced in the NeurIPS paper seems to be less
 # effective for VI.
 epochs_iter = tqdm.tqdm_notebook(range(num_epochs), desc="Epoch")
+val_loss = []
 for i in epochs_iter:
   batch_losses = []
   for x_batch, y_batch in train_loader:
